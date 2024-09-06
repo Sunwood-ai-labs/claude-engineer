@@ -1,5 +1,4 @@
 import os
-from os.path import join, dirname
 from dotenv import load_dotenv
 import json
 from tavily import TavilyClient
@@ -56,11 +55,7 @@ def setup_virtual_environment() -> Tuple[str, str]:
 
 
 # Load environment variables from .env file
-dotenv_path = join(dirname(__file__), '.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path, override=True)
-else:
-    raise ValueError(f"Error: .env file not found at {dotenv_path}")
+load_dotenv()
 
 # Initialize the Anthropic client
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -1280,35 +1275,47 @@ def display_token_usage():
 
     console.print(table)
 
-
-
-async def main():
+async def main(input_func=None, auto_mode=False, auto_mode_iterations=MAX_CONTINUATION_ITERATIONS, script_mode=False):
     global automode, conversation_history
     console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Multi-Agent and Image Support!", title="Welcome", style="bold green"))
-    console.print("Type 'exit' to end the conversation.")
-    console.print("Type 'image' to include an image in your message.")
-    console.print("Type 'automode [number]' to enter Autonomous mode with a specific number of iterations.")
-    console.print("Type 'reset' to clear the conversation history.")
-    console.print("Type 'save chat' to save the conversation to a Markdown file.")
-    console.print("While in automode, press Ctrl+C at any time to exit the automode to return to regular chat.")
+    
+    if not script_mode:
+        console.print("Type 'exit' to end the conversation.")
+        console.print("Type 'image' to include an image in your message.")
+        console.print("Type 'reset' to clear the conversation history.")
+        console.print("Type 'save chat' to save the conversation to a Markdown file.")
 
+    if auto_mode:
+        console.print(Panel(f"Entering automode with {auto_mode_iterations} iterations.", title_align="left", title="Automode", style="bold yellow"))
+        if not script_mode:
+            console.print(Panel("Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
+
+    iteration_count = 0
     while True:
-        user_input = await get_user_input()
+        if script_mode and iteration_count >= auto_mode_iterations:
+            break
 
-        if user_input.lower() == 'exit':
+        if input_func:
+            user_input = await input_func()
+        elif not script_mode:
+            user_input = await get_user_input()
+        else:
+            user_input = "Continue"
+
+        if not script_mode and user_input.lower() == 'exit':
             console.print(Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
             break
 
-        if user_input.lower() == 'reset':
+        if not script_mode and user_input.lower() == 'reset':
             reset_conversation()
             continue
 
-        if user_input.lower() == 'save chat':
+        if not script_mode and user_input.lower() == 'save chat':
             filename = save_chat()
             console.print(Panel(f"Chat saved to {filename}", title="Chat Saved", style="bold green"))
             continue
 
-        if user_input.lower() == 'image':
+        if not script_mode and user_input.lower() == 'image':
             image_path = (await get_user_input("Drag and drop your image here, then press enter: ")).strip().replace("'", "")
 
             if os.path.isfile(image_path):
@@ -1317,49 +1324,45 @@ async def main():
             else:
                 console.print(Panel("Invalid image path. Please try again.", title="Error", style="bold red"))
                 continue
-        elif user_input.lower().startswith('automode'):
+        elif auto_mode:
+            automode = True
             try:
-                parts = user_input.split()
-                if len(parts) > 1 and parts[1].isdigit():
-                    max_iterations = int(parts[1])
+                response, exit_continuation = await chat_with_claude(user_input, current_iteration=iteration_count+1, max_iterations=auto_mode_iterations)
+
+                if exit_continuation or CONTINUATION_EXIT_PHRASE in response:
+                    console.print(Panel("Automode completed.", title_align="left", title="Automode", style="green"))
+                    if not script_mode:
+                        automode = False
                 else:
-                    max_iterations = MAX_CONTINUATION_ITERATIONS
+                    console.print(Panel(f"Continuation iteration {iteration_count + 1} completed.", title_align="left", title="Automode", style="yellow"))
+                    if not script_mode:
+                        user_input = "Continue with the next step. Or STOP by saying 'AUTOMODE_COMPLETE' if you think you've achieved the results established in the original request."
+                iteration_count += 1
 
-                automode = True
-                console.print(Panel(f"Entering automode with {max_iterations} iterations. Please provide the goal of the automode.", title_align="left", title="Automode", style="bold yellow"))
-                console.print(Panel("Press Ctrl+C at any time to exit the automode loop.", style="bold yellow"))
-                user_input = await get_user_input()
-
-                iteration_count = 0
-                try:
-                    while automode and iteration_count < max_iterations:
-                        response, exit_continuation = await chat_with_claude(user_input, current_iteration=iteration_count+1, max_iterations=max_iterations)
-
-                        if exit_continuation or CONTINUATION_EXIT_PHRASE in response:
-                            console.print(Panel("Automode completed.", title_align="left", title="Automode", style="green"))
-                            automode = False
-                        else:
-                            console.print(Panel(f"Continuation iteration {iteration_count + 1} completed. Press Ctrl+C to exit automode. ", title_align="left", title="Automode", style="yellow"))
-                            user_input = "Continue with the next step. Or STOP by saying 'AUTOMODE_COMPLETE' if you think you've achieved the results established in the original request."
-                        iteration_count += 1
-
-                        if iteration_count >= max_iterations:
-                            console.print(Panel("Max iterations reached. Exiting automode.", title_align="left", title="Automode", style="bold red"))
-                            automode = False
-                except KeyboardInterrupt:
+                if iteration_count >= auto_mode_iterations:
+                    console.print(Panel("Max iterations reached. Exiting automode.", title_align="left", title="Automode", style="bold red"))
+                    if not script_mode:
+                        automode = False
+            except KeyboardInterrupt:
+                if not script_mode:
                     console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
                     automode = False
                     if conversation_history and conversation_history[-1]["role"] == "user":
                         conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
-            except KeyboardInterrupt:
-                console.print(Panel("\nAutomode interrupted by user. Exiting automode.", title_align="left", title="Automode", style="bold red"))
-                automode = False
-                if conversation_history and conversation_history[-1]["role"] == "user":
-                    conversation_history.append({"role": "assistant", "content": "Automode interrupted. How can I assist you further?"})
+                else:
+                    raise
 
-            console.print(Panel("Exited automode. Returning to regular chat.", style="green"))
+            if not script_mode:
+                console.print(Panel("Exited automode. Returning to regular chat.", style="green"))
+                auto_mode = False
         else:
             response, _ = await chat_with_claude(user_input)
 
+        if script_mode:
+            iteration_count += 1
+
 if __name__ == "__main__":
     asyncio.run(main())
+else:
+    async def run_chat(input_func=None, auto_mode=False, auto_mode_iterations=MAX_CONTINUATION_ITERATIONS, script_mode=False):
+        await main(input_func, auto_mode, auto_mode_iterations, script_mode)
