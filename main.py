@@ -15,12 +15,28 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.markdown import Markdown
 import asyncio
-import aiohttp
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
-import difflib
 import glob
 import speech_recognition as sr
+import websockets
+from pydub import AudioSegment
+from pydub.playback import play
+import datetime
+import venv
+import sys
+import signal
+import logging
+from typing import Tuple, Optional, Dict, Any
+import mimetypes
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+import subprocess
+
+# Configure logging
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Create a recognizer object
 recognizer = sr.Recognizer()
@@ -37,6 +53,75 @@ VOICE_COMMANDS = {
 recognizer = None
 microphone = None
 
+# 11 Labs TTS
+tts_enabled = True
+use_tts = False
+ELEVEN_LABS_API_KEY = os.getenv('ELEVEN_LABS_API_KEY')
+VOICE_ID = 'YOUR ID'
+MODEL_ID = 'eleven_turbo_v2_5'
+
+
+async def text_to_speech(text):
+    if not ELEVEN_LABS_API_KEY:
+        console.print("ElevenLabs API key not found. Text-to-speech is disabled.", style="bold yellow")
+        console.print("Fallback: Printing the text instead.", style="bold yellow")
+        console.print(text)
+        return
+
+    uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id={MODEL_ID}"
+    
+    async def chunk_text(text):
+        sentences = re.split('(?<=[.,?!;:—\-()[\]{}]) +', text)
+        for sentence in sentences:
+            yield sentence + " "
+
+    try:
+        logging.info("Connecting to ElevenLabs API")
+        async with websockets.connect(uri, extra_headers={'xi-api-key': ELEVEN_LABS_API_KEY}) as websocket:
+            logging.info("Connected to ElevenLabs API")
+            await websocket.send(json.dumps({
+                "text": " ",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                "xi_api_key": ELEVEN_LABS_API_KEY,
+            }))
+
+            audio_stream = AudioSegment.empty()
+            async for chunk in chunk_text(text):
+                logging.debug(f"Sending chunk: {chunk}")
+                await websocket.send(json.dumps({"text": chunk, "try_trigger_generation": True}))
+
+            await websocket.send(json.dumps({"text": ""}))  # Closing message
+            logging.info("Sent all text chunks")
+
+            while True:
+                try:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    if data.get('audio'):
+                        audio_data = base64.b64decode(data['audio'])
+                        audio_chunk = AudioSegment.from_mp3(io.BytesIO(audio_data))
+                        audio_stream += audio_chunk
+                        play(audio_chunk)  # Play each chunk as it's received
+                        logging.debug("Played audio chunk")
+                    elif data.get('isFinal'):
+                        logging.info("Received final message")
+                        break
+                except websockets.exceptions.ConnectionClosed:
+                    logging.error("WebSocket connection closed unexpectedly")
+                    console.print("WebSocket connection closed unexpectedly", style="bold red")
+                    break
+
+    except websockets.exceptions.InvalidStatusCode as e:
+        logging.error(f"Failed to connect to ElevenLabs API: {e}")
+        console.print(f"Failed to connect to ElevenLabs API: {e}", style="bold red")
+        console.print("Fallback: Printing the text instead.", style="bold yellow")
+        console.print(text)
+    except Exception as e:
+        logging.error(f"Error in text-to-speech: {str(e)}")
+        console.print(f"Error in text-to-speech: {str(e)}", style="bold red")
+        console.print("Fallback: Printing the text instead.", style="bold yellow")
+        console.print(text)
+
 def initialize_speech_recognition():
     global recognizer, microphone
     recognizer = sr.Recognizer()
@@ -45,14 +130,16 @@ def initialize_speech_recognition():
     # Adjust for ambient noise
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source, duration=1)
+    
+    logging.info("Speech recognition initialized")
 
 async def voice_input(max_retries=3):
     global recognizer, microphone
-    
-    if recognizer is None or microphone is None:
-        initialize_speech_recognition()
 
     for attempt in range(max_retries):
+        # Reinitialize speech recognition objects before each attempt
+        initialize_speech_recognition()
+
         try:
             with microphone as source:
                 console.print("Listening... Speak now.", style="bold green")
@@ -64,22 +151,31 @@ async def voice_input(max_retries=3):
             return text.lower()
         except sr.WaitTimeoutError:
             console.print(f"No speech detected. Attempt {attempt + 1} of {max_retries}.", style="bold red")
+            logging.warning(f"No speech detected. Attempt {attempt + 1} of {max_retries}")
         except sr.UnknownValueError:
             console.print(f"Speech was unintelligible. Attempt {attempt + 1} of {max_retries}.", style="bold red")
+            logging.warning(f"Speech was unintelligible. Attempt {attempt + 1} of {max_retries}")
         except sr.RequestError as e:
             console.print(f"Could not request results from speech recognition service; {e}", style="bold red")
+            logging.error(f"Could not request results from speech recognition service; {e}")
             return None
         except Exception as e:
             console.print(f"Unexpected error in voice input: {str(e)}", style="bold red")
+            logging.error(f"Unexpected error in voice input: {str(e)}")
             return None
+        
+        # Add a short delay between attempts
+        await asyncio.sleep(1)
     
     console.print("Max retries reached. Returning to text input mode.", style="bold red")
+    logging.info("Max retries reached in voice input. Returning to text input mode.")
     return None
 
 def cleanup_speech_recognition():
     global recognizer, microphone
     recognizer = None
     microphone = None
+    logging.info('Speech recognition objects cleaned up')
 
 def process_voice_command(command):
     if command in VOICE_COMMANDS:
@@ -100,16 +196,8 @@ async def get_user_input(prompt="You: "):
     })
     session = PromptSession(style=style)
     return await session.prompt_async(prompt, multiline=False)
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-import datetime
-import venv
-import subprocess
-import sys
-import signal
-import logging
-from typing import Tuple, Optional
-import mimetypes
-import mimetypes
+
+
 
 
 def setup_virtual_environment() -> Tuple[str, str]:
@@ -153,11 +241,12 @@ tavily = TavilyClient(api_key=tavily_api_key)
 console = Console()
 
 
+
 # Token tracking variables
-main_model_tokens = {'input': 0, 'output': 0}
-tool_checker_tokens = {'input': 0, 'output': 0}
-code_editor_tokens = {'input': 0, 'output': 0}
-code_execution_tokens = {'input': 0, 'output': 0}
+main_model_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+tool_checker_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+code_editor_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+code_execution_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
 
 USE_FUZZY_SEARCH = True
 
@@ -196,6 +285,7 @@ CODEEXECUTIONMODEL = "claude-3-5-sonnet-20240620"
 BASE_SYSTEM_PROMPT = """
 You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model, specialized in software development with access to a variety of tools and the ability to instruct and direct a coding agent and a code execution one. Your capabilities include:
 
+<capabilities>
 1. Creating and managing project structures
 2. Writing, debugging, and improving code across multiple languages
 3. Providing architectural insights and applying design patterns
@@ -204,9 +294,11 @@ You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model, 
 6. Performing web searches for up-to-date information
 7. Executing code and analyzing its output within an isolated 'code_execution_env' virtual environment
 8. Managing and stopping running processes started within the 'code_execution_env'
+</capabilities>
 
 Available tools and their optimal use cases:
 
+<tools>
 1. create_folders: Create new folders at the specified paths, including nested directories. Use this to create one or more directories in the project structure, even complex nested structures in a single operation.
 2. create_files: Generate one or more new files with specified content. Strive to make the files as complete and useful as possible.
 3. edit_and_apply_multiple: Examine and modify one or more existing files by instructing a separate AI coding agent. You are responsible for providing clear, detailed instructions for each file. When using this tool:
@@ -218,10 +310,17 @@ Available tools and their optimal use cases:
 4. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output. Use this when you need to test code functionality or diagnose issues. Remember that all code execution happens in this isolated environment. This tool returns a process ID for long-running processes.
 5. stop_process: Stop a running process by its ID. Use this when you need to terminate a long-running process started by the execute_code tool.
 6. read_multiple_files: Read the contents of one or more existing files, supporting wildcards (e.g., '*.py') and recursive directory reading. This tool can handle single or multiple file paths, directory paths, and wildcard patterns. Use this when you need to examine or work with file contents, especially for multiple files or entire directories.
+ IMPORTANT: Before using the read_multiple_files tool, always check if the files you need are already in your context (system prompt).
+    If the file contents are already available to you, use that information directly instead of calling the read_multiple_files tool.
+    Only use the read_multiple_files tool for files that are not already in your context.
 7. list_files: List all files and directories in a specified folder.
 8. tavily_search: Perform a web search using the Tavily API for up-to-date information.
-9. Scan project folders to turn them into an .md file for better context.
+9. scan_folder: Scan a specified folder and create a Markdown file with the contents of all coding text files, excluding binary files and common ignored folders. Use this tool to generate comprehensive documentation of project structures.
+10. run_shell_command: Execute a shell command and return its output. Use this tool when you need to run system commands or interact with the operating system. Ensure the command is safe and appropriate for the current operating system.
+IMPORTANT: Use this tool to install dependencies in the code_execution_env when using the execute_code tool.
+</tools>
 
+<tool_usage_guidelines>
 Tool Usage Guidelines:
 - Always use the most appropriate tool for the task at hand.
 - Provide detailed and clear instructions when using tools, especially for edit_and_apply_multiple.
@@ -229,27 +328,34 @@ Tool Usage Guidelines:
 - Use execute_code to run and test code within the 'code_execution_env' virtual environment, then analyze the results.
 - For long-running processes, use the process ID returned by execute_code to stop them later if needed.
 - Proactively use tavily_search when you need up-to-date information or additional context.
-- When working with files, use read_multiple_files for both single and multiple file reads.
+- When working with files, use read_multiple_files for both single and multiple file read making sure that the files are not already in your context.
+</tool_usage_guidelines>
 
+<error_handling>
 Error Handling and Recovery:
 - If a tool operation fails, carefully analyze the error message and attempt to resolve the issue.
 - For file-related errors, double-check file paths and permissions before retrying.
 - If a search fails, try rephrasing the query or breaking it into smaller, more specific searches.
 - If code execution fails, analyze the error output and suggest potential fixes, considering the isolated nature of the environment.
 - If a process fails to stop, consider potential reasons and suggest alternative approaches.
+</error_handling>
 
+<project_management>
 Project Creation and Management:
 1. Start by creating a root folder for new projects.
 2. Create necessary subdirectories and files within the root folder.
 3. Organize the project structure logically, following best practices for the specific project type.
+</project_management>
 
 Always strive for accuracy, clarity, and efficiency in your responses and actions. Your instructions must be precise and comprehensive. If uncertain, use the tavily_search tool or admit your limitations. When executing code, always remember that it runs in the isolated 'code_execution_env' virtual environment. Be aware of any long-running processes you start and manage them appropriately, including stopping them when they are no longer needed.
 
+<tool_usage_best_practices>
 When using tools:
 1. Carefully consider if a tool is necessary before using it.
 2. Ensure all required parameters are provided and valid.
 3. Handle both successful results and errors gracefully.
 4. Provide clear explanations of tool usage and results to the user.
+</tool_usage_best_practices>
 
 Remember, you are an AI assistant, and your primary goal is to help the user accomplish their tasks effectively and efficiently while maintaining the integrity and security of their development environment.
 """
@@ -257,25 +363,36 @@ Remember, you are an AI assistant, and your primary goal is to help the user acc
 AUTOMODE_SYSTEM_PROMPT = """
 You are currently in automode. Follow these guidelines:
 
+<goal_setting>
 1. Goal Setting:
    - Set clear, achievable goals based on the user's request.
    - Break down complex tasks into smaller, manageable goals.
+</goal_setting>
 
+<goal_execution>
 2. Goal Execution:
    - Work through goals systematically, using appropriate tools for each task.
    - Utilize file operations, code writing, and web searches as needed.
    - Always read a file before editing and review changes after editing.
+</goal_execution>
 
+<progress_tracking>
 3. Progress Tracking:
    - Provide regular updates on goal completion and overall progress.
    - Use the iteration information to pace your work effectively.
+</progress_tracking>
 
+<task_breakdown>
 Break Down Complex Tasks:
 When faced with a complex task or project, break it down into smaller, manageable steps. Provide a clear outline of the steps involved, potential challenges, and how to approach each part of the task.
+</task_breakdown>
 
+<explanation_preference>
 Prefer Answering Without Code:
 When explaining concepts or providing solutions, prioritize clear explanations and pseudocode over full code implementations. Only provide full code snippets when explicitly requested or when it's essential for understanding.
+</explanation_preference>
 
+<code_review_process>
 Code Review Process:
 When reviewing code, follow these steps:
 1. Understand the context and purpose of the code
@@ -285,7 +402,9 @@ When reviewing code, follow these steps:
 5. Ensure adherence to best practices and coding standards
 6. Consider security implications
 7. Provide constructive feedback with explanations
+</code_review_process>
 
+<project_planning>
 Project Planning:
 When planning a project, consider the following:
 1. Define clear project goals and objectives
@@ -295,7 +414,9 @@ When planning a project, consider the following:
 5. Suggest appropriate tools and technologies
 6. Outline a testing and quality assurance strategy
 7. Consider scalability and future maintenance
+</project_planning>
 
+<security_review>
 Security Review:
 When conducting a security review, focus on:
 1. Identifying potential vulnerabilities in the code
@@ -305,24 +426,34 @@ When conducting a security review, focus on:
 5. Checking for secure communication protocols
 6. Identifying any use of deprecated or insecure functions
 7. Suggesting security best practices and improvements
+</security_review>
 
 Remember to apply these additional skills and processes when assisting users with their software development tasks and projects.
+
+<tool_usage>
 4. Tool Usage:
    - Leverage all available tools to accomplish your goals efficiently.
    - Prefer edit_and_apply_multiple for file modifications, applying changes in chunks for large edits.
    - Use tavily_search proactively for up-to-date information.
+</tool_usage>
 
+<error_handling>
 5. Error Handling:
    - If a tool operation fails, analyze the error and attempt to resolve the issue.
    - For persistent errors, consider alternative approaches to achieve the goal.
+</error_handling>
 
+<automode_completion>
 6. Automode Completion:
    - When all goals are completed, respond with "AUTOMODE_COMPLETE" to exit automode.
    - Do not ask for additional tasks or modifications once goals are achieved.
+</automode_completion>
 
+<iteration_awareness>
 7. Iteration Awareness:
    - You have access to this {iteration_info}.
    - Use this information to prioritize tasks and manage time effectively.
+</iteration_awareness>
 
 Remember: Focus on completing the established goals efficiently and effectively. Avoid unnecessary conversations or requests for additional tasks.
 """
@@ -331,9 +462,9 @@ Remember: Focus on completing the established goals efficiently and effectively.
 def update_system_prompt(current_iteration: Optional[int] = None, max_iterations: Optional[int] = None) -> str:
     global file_contents
     chain_of_thought_prompt = """
-    IMPORTANT: Before using the read_multiple_files tool, always check if the files you need are already in your context (system prompt).
-    If the file contents are already available to you, use that information directly instead of calling the read_multiple_files tool.
-    Only use the read_multiple_files tool for files that are not already in your context.
+    Answer the user's request using relevant tools (if they are available). Before calling a tool, do some analysis within <thinking></thinking> tags. First, think about which of the provided tools is the relevant tool to answer the user's request. Second, go through each of the required parameters of the relevant tool and determine if the user has directly provided or given enough information to infer a value. When deciding if the parameter can be inferred, carefully consider all the context to see if it supports a specific value. If all of the required parameters are present or can be reasonably inferred, close the thinking tag and proceed with the tool call. BUT, if one of the values for a required parameter is missing, DO NOT invoke the function (not even with fillers for the missing params) and instead, ask the user to provide the missing parameters. DO NOT ask for more information on optional parameters if it is not provided.
+
+    Do not reflect on the quality of the returned search results in your response.
     """
 
     files_in_context = "\n".join(file_contents.keys())
@@ -542,16 +673,21 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
     if isinstance(files, dict):
         files = [files]
 
+    logging.info(f"Starting edit_and_apply_multiple with {len(files)} file(s)")
+
     for file in files:
         path = file['path']
         instructions = file['instructions']
+        logging.info(f"Processing file: {path}")
         try:
             original_content = file_contents.get(path, "")
             if not original_content:
+                logging.info(f"Reading content for file: {path}")
                 with open(path, 'r') as f:
                     original_content = f.read()
                 file_contents[path] = original_content
 
+            logging.info(f"Generating edit instructions for file: {path}")
             edit_instructions = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
 
             if edit_instructions:
@@ -560,14 +696,17 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
                     console.print(f"Block {i}:")
                     console.print(Panel(f"SEARCH:\n{block['search']}\n\nREPLACE:\n{block['replace']}\nSimilarity: {block['similarity']:.2f}", expand=False))
 
+                logging.info(f"Applying edits to file: {path}")
                 edited_content, changes_made, failed_edits, console_output = await apply_edits(path, edit_instructions, original_content)
                 console_outputs.append(console_output)
 
                 if changes_made:
                     file_contents[path] = edited_content
                     console.print(Panel(f"File contents updated in system prompt: {path}", style="green"))
+                    logging.info(f"Changes applied to file: {path}")
 
                     if failed_edits:
+                        logging.warning(f"Some edits failed for file: {path}")
                         results.append({
                             "path": path,
                             "status": "partial_success",
@@ -583,18 +722,21 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
                             "edited_content": edited_content
                         })
                 else:
+                    logging.warning(f"No changes applied to file: {path}")
                     results.append({
                         "path": path,
                         "status": "no_changes",
                         "message": f"No changes could be applied to {path}. Please review the edit instructions and try again."
                     })
             else:
+                logging.warning(f"No edit instructions generated for file: {path}")
                 results.append({
                     "path": path,
                     "status": "no_instructions",
                     "message": f"No edit instructions generated for {path}"
                 })
         except Exception as e:
+            logging.error(f"Error editing/applying to file {path}: {str(e)}")
             error_message = f"Error editing/applying to file {path}: {str(e)}"
             results.append({
                 "path": path,
@@ -603,6 +745,7 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
             })
             console_outputs.append(error_message)
 
+    logging.info("Completed edit_and_apply_multiple")
     return results, "\n".join(console_outputs)
 
 
@@ -702,12 +845,21 @@ async def execute_code(code, timeout=10):
     global running_processes
     venv_path, activate_script = setup_virtual_environment()
 
+    # Input validation
+    if not isinstance(code, str):
+        raise ValueError("code must be a string")
+    if not isinstance(timeout, (int, float)):
+        raise ValueError("timeout must be a number")
+
     # Generate a unique identifier for this process
     process_id = f"process_{len(running_processes)}"
 
     # Write the code to a temporary file
-    with open(f"{process_id}.py", "w") as f:
-        f.write(code)
+    try:
+        with open(f"{process_id}.py", "w") as f:
+            f.write(code)
+    except IOError as e:
+        return process_id, f"Error writing code to file: {str(e)}"
 
     # Prepare the command to run the code
     if sys.platform == "win32":
@@ -715,32 +867,41 @@ async def execute_code(code, timeout=10):
     else:
         command = f'source "{activate_script}" && python3 {process_id}.py'
 
-    # Create a process to run the command
-    process = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        shell=True,
-        preexec_fn=None if sys.platform == "win32" else os.setsid
-    )
-
-    # Store the process in our global dictionary
-    running_processes[process_id] = process
-
     try:
-        # Wait for initial output or timeout
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        stdout = stdout.decode()
-        stderr = stderr.decode()
-        return_code = process.returncode
-    except asyncio.TimeoutError:
-        # If we timeout, it means the process is still running
-        stdout = "Process started and running in the background."
-        stderr = ""
-        return_code = "Running"
+        # Create a process to run the command
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            shell=True,
+            preexec_fn=None if sys.platform == "win32" else os.setsid
+        )
 
-    execution_result = f"Process ID: {process_id}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n\nReturn Code: {return_code}"
-    return process_id, execution_result
+        # Store the process in our global dictionary
+        running_processes[process_id] = process
+
+        try:
+            # Wait for initial output or timeout
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout = stdout.decode()
+            stderr = stderr.decode()
+            return_code = process.returncode
+        except asyncio.TimeoutError:
+            # If we timeout, it means the process is still running
+            stdout = "Process started and running in the background."
+            stderr = ""
+            return_code = "Running"
+
+        execution_result = f"Process ID: {process_id}\n\nStdout:\n{stdout}\n\nStderr:\n{stderr}\n\nReturn Code: {return_code}"
+        return process_id, execution_result
+    except Exception as e:
+        return process_id, f"Error executing code: {str(e)}"
+    finally:
+        # Cleanup: remove the temporary file
+        try:
+            os.remove(f"{process_id}.py")
+        except OSError:
+            pass  # Ignore errors in removing the file
 
 # Update the read_multiple_files function to handle both single and multiple files
 def read_multiple_files(paths, recursive=False):
@@ -803,6 +964,26 @@ def stop_process(process_id):
         return f"Process {process_id} has been stopped."
     else:
         return f"No running process found with ID {process_id}."
+
+def run_shell_command(command):
+    try:
+        result = subprocess.run(command, shell=True, check=True, text=True, capture_output=True)
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "return_code": result.returncode
+        }
+    except subprocess.CalledProcessError as e:
+        return {
+            "stdout": e.stdout,
+            "stderr": e.stderr,
+            "return_code": e.returncode,
+            "error": str(e)
+        }
+    except Exception as e:
+        return {
+            "error": f"An error occurred while executing the command: {str(e)}"
+        }
 
 
 tools = [
@@ -994,20 +1175,39 @@ tools = [
             },
             "required": ["query"]
         }
+    },
+    {
+        "name": "run_shell_command",
+        "description": "Execute a shell command and return its output. This tool should be used when you need to run system commands or interact with the operating system. It will return the standard output, standard error, and return code of the executed command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute. Ensure the command is safe and appropriate for the current operating system."
+                }
+            },
+            "required": ["command"]
+        }
     }
 ]
 
-from typing import Dict, Any
-import os
-import mimetypes
-import asyncio
+
 
 async def decide_retry(tool_checker_response, edit_results):
     try:
         response = client.messages.create(
             model=TOOLCHECKERMODEL,
             max_tokens=1000,
-            system="You are an AI assistant tasked with deciding whether to retry editing files based on the previous edit results and the AI's response. Respond with a JSON object containing 'retry' (boolean) and 'files_to_retry' (list of file paths).",
+            system="""You are an AI assistant tasked with deciding whether to retry editing files based on the previous edit results and the AI's response. Respond with a JSON object containing 'retry' (boolean) and 'files_to_retry' (list of file paths).
+
+Example of the expected JSON response:
+{
+    "retry": true,
+    "files_to_retry": ["/path/to/file1.py", "/path/to/file2.py"]
+}
+
+Only return the JSON object, nothing else. Ensure that the JSON is properly formatted with double quotes around property names and string values.""",
             messages=[
                 {"role": "user", "content": f"Previous edit results: {json.dumps(edit_results)}\n\nAI's response: {tool_checker_response}\n\nDecide whether to retry editing any files."}
             ]
@@ -1089,6 +1289,8 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
                 result += "\n\nNote: The process is still running in the background."
         elif tool_name == "scan_folder":
             result = scan_folder(tool_input["folder_path"], tool_input["output_file"])
+        elif tool_name == "run_shell_command":
+            result = run_shell_command(tool_input["command"])
         else:
             is_error = True
             result = f"Unknown tool: {tool_name}"
@@ -1262,7 +1464,17 @@ def save_chat():
 
 
 async def chat_with_claude(user_input, image_path=None, current_iteration=None, max_iterations=None):
-    global conversation_history, automode, main_model_tokens
+    global conversation_history, automode, main_model_tokens, use_tts, tts_enabled
+
+    # Input validation
+    if not isinstance(user_input, str):
+        raise ValueError("user_input must be a string")
+    if image_path is not None and not isinstance(image_path, str):
+        raise ValueError("image_path must be a string or None")
+    if current_iteration is not None and not isinstance(current_iteration, int):
+        raise ValueError("current_iteration must be an integer or None")
+    if max_iterations is not None and not isinstance(max_iterations, int):
+        raise ValueError("max_iterations must be an integer or None")
 
     current_conversation = []
 
@@ -1319,44 +1531,52 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
     # Combine filtered history with current conversation to maintain context
     messages = filtered_conversation_history + current_conversation
 
-    try:
-        # MAINMODEL call with prompt caching
-        response = client.beta.prompt_caching.messages.create(
-            model=MAINMODEL,
-            max_tokens=8000,
-            system=[
-                {
-                    "type": "text",
-                    "text": update_system_prompt(current_iteration, max_iterations),
-                    "cache_control": {"type": "ephemeral"}
-                },
-                {
-                    "type": "text",
-                    "text": json.dumps(tools),
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ],
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "auto"},
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
-        )
-        # Update token usage for MAINMODEL
-        main_model_tokens['input'] += response.usage.input_tokens
-        main_model_tokens['output'] += response.usage.output_tokens
-        main_model_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
-        main_model_tokens['cache_read'] = response.usage.cache_read_input_tokens
-    except APIStatusError as e:
-        if e.status_code == 429:
-            console.print(Panel("Rate limit exceeded. Retrying after a short delay...", title="API Error", style="bold yellow"))
-            time.sleep(5)
-            return await chat_with_claude(user_input, image_path, current_iteration, max_iterations)
-        else:
+    max_retries = 3
+    retry_delay = 5
+
+    for attempt in range(max_retries):
+        try:
+            # MAINMODEL call with prompt caching
+            response = client.beta.prompt_caching.messages.create(
+                model=MAINMODEL,
+                max_tokens=8000,
+                system=[
+                    {
+                        "type": "text",
+                        "text": update_system_prompt(current_iteration, max_iterations),
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": json.dumps(tools),
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
+                messages=messages,
+                tools=tools,
+                tool_choice={"type": "auto"},
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
+            )
+            # Update token usage for MAINMODEL
+            main_model_tokens['input'] += response.usage.input_tokens
+            main_model_tokens['output'] += response.usage.output_tokens
+            main_model_tokens['cache_write'] = response.usage.cache_creation_input_tokens
+            main_model_tokens['cache_read'] = response.usage.cache_read_input_tokens
+            break  # If successful, break out of the retry loop
+        except APIStatusError as e:
+            if e.status_code == 429 and attempt < max_retries - 1:
+                console.print(Panel(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})", title="API Error", style="bold yellow"))
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
+                return "I'm sorry, there was an error communicating with the AI. Please try again.", False
+        except APIError as e:
             console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
             return "I'm sorry, there was an error communicating with the AI. Please try again.", False
-    except APIError as e:
-        console.print(Panel(f"API Error: {str(e)}", title="API Error", style="bold red"))
-        return "I'm sorry, there was an error communicating with the AI. Please try again.", False
+    else:
+        console.print(Panel("Max retries reached. Unable to communicate with the AI.", title="Error", style="bold red"))
+        return "I'm sorry, there was a persistent error communicating with the AI. Please try again later.", False
 
     assistant_response = ""
     exit_continuation = False
@@ -1371,6 +1591,9 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             tool_uses.append(content_block)
 
     console.print(Panel(Markdown(assistant_response), title="Claude's Response", title_align="left", border_style="blue", expand=False))
+    
+    if tts_enabled and use_tts:
+        await text_to_speech(assistant_response)
 
     # Display files in context
     if file_contents:
@@ -1397,7 +1620,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         else:
             # Format the tool result content for proper rendering
             formatted_result = json.dumps(tool_result, indent=2) if isinstance(tool_result, (dict, list)) else str(tool_result)
-            console.print(Panel(formatted_result, title_align="left", title="Tool Result", style="green"))
+            # console.print(Panel(formatted_result, title_align="left", title="Tool Result", style="green"))
 
         current_conversation.append({
             "role": "assistant",
@@ -1465,6 +1688,8 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
                 if tool_content_block.type == "text":
                     tool_checker_response += tool_content_block.text
             console.print(Panel(Markdown(tool_checker_response), title="Claude's Response to Tool Result",  title_align="left", border_style="blue", expand=False))
+            if use_tts:
+                await text_to_speech(tool_checker_response)
             assistant_response += "\n\n" + tool_checker_response
 
             # If the tool was edit_and_apply_multiple, let the AI decide whether to retry
@@ -1477,7 +1702,7 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
                     console.print(Panel(retry_console_output, title="Retry Result", style="cyan"))
                     assistant_response += f"\n\nRetry result: {json.dumps(retry_result, indent=2)}"
                 else:
-                    console.print(Panel("Clude has decided not to retry editing", style="green"))
+                    console.print(Panel("Claude has decided not to retry editing", style="green"))
 
         except APIError as e:
             error_message = f"Error in tool response: {str(e)}"
@@ -1503,10 +1728,10 @@ def reset_code_editor_memory():
 def reset_conversation():
     global conversation_history, main_model_tokens, tool_checker_tokens, code_editor_tokens, code_execution_tokens, file_contents, code_editor_files
     conversation_history = []
-    main_model_tokens = {'input': 0, 'output': 0}
-    tool_checker_tokens = {'input': 0, 'output': 0}
-    code_editor_tokens = {'input': 0, 'output': 0}
-    code_execution_tokens = {'input': 0, 'output': 0}
+    main_model_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+    tool_checker_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+    code_editor_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+    code_execution_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
     file_contents = {}
     code_editor_files = set()
     reset_code_editor_memory()
@@ -1546,9 +1771,9 @@ def display_token_usage():
                           ("Tool Checker", tool_checker_tokens),
                           ("Code Editor", code_editor_tokens),
                           ("Code Execution", code_execution_tokens)]:
-        input_tokens = tokens['input']
-        output_tokens = tokens['output']
-        cache_write_tokens = tokens.get('cache_creation', 0)
+        input_tokens = tokens.get('input', 0)
+        output_tokens = tokens.get('output', 0)
+        cache_write_tokens = tokens.get('cache_write', 0)
         cache_read_tokens = tokens.get('cache_read', 0)
         total_tokens = input_tokens + output_tokens + cache_write_tokens + cache_read_tokens
 
@@ -1600,15 +1825,43 @@ def display_token_usage():
 
 
 
+async def test_voice_mode():
+    global voice_mode
+    voice_mode = True
+    initialize_speech_recognition()
+    console.print(Panel("Entering voice input test mode. Say a few phrases, then say 'exit voice mode' to end the test.", style="bold green"))
+    
+    while voice_mode:
+        user_input = await voice_input()
+        if user_input is None:
+            voice_mode = False
+            cleanup_speech_recognition()
+            console.print(Panel("Exited voice input test mode due to error.", style="bold yellow"))
+            break
+        
+        stay_in_voice_mode, command_result = process_voice_command(user_input)
+        if not stay_in_voice_mode:
+            voice_mode = False
+            cleanup_speech_recognition()
+            console.print(Panel("Exited voice input test mode.", style="bold green"))
+            break
+        elif command_result:
+            console.print(Panel(command_result, style="cyan"))
+    
+    console.print(Panel("Voice input test completed.", style="bold green"))
+
 async def main():
-    global automode, conversation_history
-    console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Multi-Agent, Image, and Voice Support!", title="Welcome", style="bold green"))
+    global automode, conversation_history, use_tts, tts_enabled
+    console.print(Panel("Welcome to the Claude-3-Sonnet Engineer Chat with Multi-Agent, Image, Voice, and Text-to-Speech Support!", title="Welcome", style="bold green"))
     console.print("Type 'exit' to end the conversation.")
     console.print("Type 'image' to include an image in your message.")
     console.print("Type 'voice' to enter voice input mode.")
+    console.print("Type 'test voice' to run a voice input test.")
     console.print("Type 'automode [number]' to enter Autonomous mode with a specific number of iterations.")
     console.print("Type 'reset' to clear the conversation history.")
     console.print("Type 'save chat' to save the conversation to a Markdown file.")
+    console.print("Type '11labs on' to enable text-to-speech.")
+    console.print("Type '11labs off' to disable text-to-speech.")
     console.print("While in automode, press Ctrl+C at any time to exit the automode to return to regular chat.")
 
     voice_mode = False
@@ -1622,10 +1875,16 @@ async def main():
                 console.print(Panel("Exited voice input mode due to error. Returning to text input.", style="bold yellow"))
                 continue
             
-            if user_input.lower() == 'exit voice mode':
+            stay_in_voice_mode, command_result = process_voice_command(user_input)
+            if not stay_in_voice_mode:
                 voice_mode = False
                 cleanup_speech_recognition()
                 console.print(Panel("Exited voice input mode. Returning to text input.", style="bold green"))
+                if command_result:
+                    console.print(Panel(command_result, style="cyan"))
+                continue
+            elif command_result:
+                console.print(Panel(command_result, style="cyan"))
                 continue
         else:
             user_input = await get_user_input()
@@ -1633,6 +1892,24 @@ async def main():
         if user_input.lower() == 'exit':
             console.print(Panel("Thank you for chatting. Goodbye!", title_align="left", title="Goodbye", style="bold green"))
             break
+
+        if user_input.lower() == 'test voice':
+            await test_voice_mode()
+            continue
+
+        if user_input.lower() == '11labs on':
+            use_tts = True
+            tts_enabled = True
+            console.print(Panel("Text-to-speech enabled.", style="bold green"))
+            continue
+
+        if user_input.lower() == '11labs off':
+            use_tts = False
+            tts_enabled = False
+            console.print(Panel("Text-to-speech disabled.", style="bold yellow"))
+            continue
+
+
 
         if user_input.lower() == 'reset':
             reset_conversation()
@@ -1714,5 +1991,54 @@ async def main():
         else:
             response, _ = await chat_with_claude(user_input)
 
+def validate_files_structure(files):
+    if not isinstance(files, (dict, list)):
+        raise ValueError("Invalid 'files' structure. Expected a dictionary or a list of dictionaries.")
+    
+    if isinstance(files, dict):
+        files = [files]
+    
+    for file in files:
+        if not isinstance(file, dict):
+            raise ValueError("Each file must be a dictionary.")
+        if 'path' not in file or 'instructions' not in file:
+            raise ValueError("Each file dictionary must contain 'path' and 'instructions' keys.")
+        if not isinstance(file['path'], str) or not isinstance(file['instructions'], str):
+            raise ValueError("'path' and 'instructions' must be strings.")
+
+    return files
+
+def validate_files_structure(files):
+    if not isinstance(files, (dict, list)):
+        raise ValueError("Invalid 'files' structure. Expected a dictionary or a list of dictionaries.")
+    
+    if isinstance(files, dict):
+        files = [files]
+    
+    for file in files:
+        if not isinstance(file, dict):
+            raise ValueError("Each file must be a dictionary.")
+        if 'path' not in file or 'instructions' not in file:
+            raise ValueError("Each file dictionary must contain 'path' and 'instructions' keys.")
+        if not isinstance(file['path'], str) or not isinstance(file['instructions'], str):
+            raise ValueError("'path' and 'instructions' must be strings.")
+
+    return files
+
+
+
+    # Add more tests for other functions as needed
+
 if __name__ == "__main__":
-    asyncio.run(main())
+
+
+    # Run the main program
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("\nProgram interrupted by user. Exiting...", style="bold red")
+    except Exception as e:
+        console.print(f"An unexpected error occurred: {str(e)}", style="bold red")
+        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
+    finally:
+        console.print("Program finished. Goodbye!", style="bold green")
